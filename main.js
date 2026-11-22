@@ -1,6 +1,11 @@
-const { app, BrowserWindow, globalShortcut, net } = require('electron');
+const { app, BrowserWindow, globalShortcut, net, session } = require('electron');
 const fs = require('fs');
 const path = require('path');
+
+// Phone pairing, login and settings live in the "pairings" folder next to the app
+// (dev: project folder; installed: folder of the .exe), so they survive renames / rebuilds
+const APP_DIR = app.isPackaged ? path.dirname(process.execPath) : __dirname;
+app.setPath('userData', path.join(APP_DIR, 'pairings'));
 
 const TV_URL = 'https://www.youtube.com/tv';
 
@@ -221,12 +226,19 @@ function createWindow() {
 app.commandLine.appendSwitch('disable-renderer-backgrounding');
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 
+// Write phone pairing + login to disk now (protects against power-off / force close)
+function flushStorage() {
+  try { session.defaultSession.flushStorageData(); session.defaultSession.cookies.flushStore(); } catch {}
+}
+
 app.whenReady().then(() => {
   createWindow();
+  setInterval(flushStorage, 30000);
   globalShortcut.register('F11', () => win && win.setFullScreen(!win.isFullScreen()));
   globalShortcut.register('CommandOrControl+R', () => win && start());
   globalShortcut.register('CommandOrControl+Q', () => app.quit());
 });
 
+app.on('before-quit', flushStorage);
 app.on('will-quit', () => globalShortcut.unregisterAll());
 app.on('window-all-closed', () => app.quit());
