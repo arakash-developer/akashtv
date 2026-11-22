@@ -8,7 +8,10 @@
     "start": "electron .",
     "dist": "electron-builder",
     "icon": "electron scripts/make-icon.js",
-    "shortcut": "powershell -ExecutionPolicy Bypass -File create-shortcut.ps1"
+    "shortcut": "powershell -ExecutionPolicy Bypass -File create-shortcut.ps1",
+    "launcher": "node launcher.js",
+    "launcher-boot": "powershell -ExecutionPolicy Bypass -File start-launcher-on-boot.ps1",
+    "launcher-link": "node -e \"const k=require('./pairings/launcher.json').key,os=require('os');Object.values(os.networkInterfaces()).flat().filter(i=>i.family==='IPv4'&&!i.internal).forEach(i=>console.log('http://'+i.address+':8765/?key='+k))\""
   },
   "devDependencies": {
     "electron": "^33.0.0",
@@ -18,8 +21,14 @@
     "appId": "com.akash.akashtv",
     "icon": "assets/icon.png",
     "productName": "AKASH TV",
-    "win": { "target": "nsis" },
-    "linux": { "target": "AppImage" },
-    "mac": { "target": "dmg" }
+    "win": {
+      "target": "nsis"
+    },
+    "linux": {
+      "target": "AppImage"
+    },
+    "mac": {
+      "target": "dmg"
+    }
   }
 }
