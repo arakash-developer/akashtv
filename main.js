@@ -25,6 +25,71 @@ function loadLocalUAs() {
 
 const CHECK_TIMEOUT_MS = 20000;
 let win, uaList = [], uaIndex = 0, checking = false, checkTimer = null;
+let waiting = false, waitTimer = null, lastSoftRetry = 0;
+
+// Chromium net error codes that mean "connection problem", not "bad user agent"
+const NETWORK_ERRORS = new Set([-7, -21, -100, -101, -102, -103, -104, -105, -106, -109, -118, -137, -324]);
+
+function showMessage(html) {
+  win.loadURL('data:text/html,' + encodeURIComponent(
+    '<body style="background:#000;color:#fff;font:24px sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;text-align:center">' +
+    html + '</body>'));
+}
+
+// Pause everything until the internet is back, then run `resume`
+function waitForOnline(resume) {
+  if (waiting) return;
+  waiting = true;
+  clearTimeout(checkTimer);
+  console.log('[NET] offline, waiting...');
+  showMessage('No internet connection.<br>Waiting to reconnect...');
+  const poll = () => {
+    if (!win) return;
+    if (net.isOnline()) { waiting = false; console.log('[NET] back online'); resume(); }
+    else waitTimer = setTimeout(poll, 3000);
+  };
+  waitTimer = setTimeout(poll, 3000);
+}
+
+function stopWaiting() { waiting = false; clearTimeout(waitTimer); }
+
+// Reload YouTube TV with the current (already working) user agent
+function reloadCurrent() {
+  const ua = uaList[uaIndex];
+  if (!ua) return start();
+  if (!net.isOnline()) return waitForOnline(reloadCurrent);
+  win.loadURL(targetURL(), { userAgent: ua });
+}
+
+// ---- Resume playback after any reload / UA change ----
+let lastWatch = null; // { url, time }
+
+const targetURL = () => (lastWatch ? lastWatch.url : TV_URL);
+
+// Every 5s remember which video is playing and where
+setInterval(async () => {
+  if (!win || checking || waiting) return;
+  try {
+    const st = await win.webContents.executeJavaScript(
+      `(() => { const v = document.querySelector('video');
+        return { url: location.href, time: v && v.duration ? v.currentTime : 0 }; })()`);
+    if (!st.url.includes('youtube.com/tv')) return;
+    lastWatch = /[?&]v=/.test(st.url) ? { url: st.url, time: st.time || (lastWatch && lastWatch.url === st.url ? lastWatch.time : 0) } : null;
+  } catch {}
+}, 5000);
+
+// Seek the video back to where it was, once it has loaded
+function resumeVideo() {
+  if (!lastWatch || lastWatch.time < 5) return;
+  const t = Math.floor(lastWatch.time);
+  console.log(`[PLAY] resuming at ${t}s`);
+  win.webContents.executeJavaScript(`(() => { let n = 0; const iv = setInterval(() => {
+    const v = document.querySelector('video');
+    if (v && v.readyState >= 1) { if (v.currentTime < ${t} - 3) v.currentTime = ${t}; v.play().catch(() => {}); clearInterval(iv); }
+    else if (++n > 60) clearInterval(iv); }, 500); })()`).catch(() => {});
+}
+
+const retry = () => (checking ? tryCurrentUA() : reloadCurrent());
 
 const savePath = () => path.join(app.getPath('userData'), 'working-ua.json');
 const loadSavedUA = () => { try { return JSON.parse(fs.readFileSync(savePath(), 'utf8')).ua; } catch { return null; } };
@@ -59,28 +124,28 @@ async function buildUAList() {
 
 function tryCurrentUA() {
   const ua = uaList[uaIndex];
+  if (!net.isOnline()) { checking = true; return waitForOnline(tryCurrentUA); }
   console.log(`[UA] trying #${uaIndex + 1}/${uaList.length}`);
   checking = true;
   win.webContents.setUserAgent(ua);
-  win.loadURL(TV_URL, { userAgent: ua });
+  win.loadURL(targetURL(), { userAgent: ua });
   clearTimeout(checkTimer);
   checkTimer = setTimeout(() => verify(), CHECK_TIMEOUT_MS);
 }
 
 function nextUA(reason) {
-  if (!checking) return;
+  if (!checking || waiting) return;
+  if (!net.isOnline()) return waitForOnline(tryCurrentUA); // not the UA's fault
   console.log(`[UA] failed (${reason})`);
   clearTimeout(checkTimer);
   uaIndex++;
   if (uaIndex < uaList.length) return tryCurrentUA();
   checking = false;
-  win.loadURL('data:text/html,' + encodeURIComponent(
-    '<body style="background:#000;color:#fff;font:24px sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;text-align:center">' +
-    'No working TV user agent found.<br>Update the list and press Ctrl+R.</body>'));
+  showMessage('No working TV user agent found.<br>Update the list and press Ctrl+R.');
 }
 
 async function verify() {
-  if (!checking) return;
+  if (!checking || waiting) return;
   const url = win.webContents.getURL();
   if (!url.includes('youtube.com/tv')) return nextUA('redirected away from /tv');
   try {
@@ -92,11 +157,13 @@ async function verify() {
       clearTimeout(checkTimer);
       saveUA(uaList[uaIndex]);
       console.log('[UA] working, saved.');
+      resumeVideo();
     } else nextUA('TV interface not detected');
   } catch { nextUA('page check error'); }
 }
 
 async function start() {
+  stopWaiting();
   uaList = await buildUAList();
   uaIndex = 0;
   checking = true;
@@ -113,13 +180,40 @@ function createWindow() {
 
   win.webContents.on('did-navigate', (_e, url) => {
     if (url.startsWith('data:') || url.includes('youtube.com/tv') || url.includes('accounts.google.com')) return;
-    if (checking) nextUA('redirected to ' + url);
-    else start();
+    if (checking) return nextUA('redirected to ' + url);
+    // While watching: first try a quiet reload with the same UA; only re-test all UAs if it happens again soon
+    if (Date.now() - lastSoftRetry > 60000) {
+      lastSoftRetry = Date.now();
+      console.log('[UA] redirected while watching, reloading with same UA');
+      reloadCurrent();
+    } else start();
   });
 
-  win.webContents.on('did-finish-load', () => { if (checking) setTimeout(verify, 6000); });
+  win.webContents.on('did-finish-load', () => {
+    if (win.webContents.getURL().startsWith('data:')) return;
+    if (checking) setTimeout(verify, 6000);
+    else resumeVideo();
+  });
 
-  win.on('closed', () => { win = null; });
+  win.webContents.on('did-fail-load', (_e, code, desc, _url, isMainFrame) => {
+    if (!isMainFrame || code === -3 || waiting) return; // -3 = aborted by a new navigation
+    console.log(`[NET] load failed (${code} ${desc})`);
+    if (!net.isOnline()) return waitForOnline(retry);
+    if (NETWORK_ERRORS.has(code)) { clearTimeout(checkTimer); return setTimeout(retry, 5000); }
+    if (!checking) setTimeout(reloadCurrent, 5000);
+  });
+
+  win.webContents.on('render-process-gone', (_e, d) => {
+    console.log(`[APP] page crashed (${d.reason}), reloading`);
+    if (!waiting) setTimeout(retry, 2000);
+  });
+
+  win.webContents.on('unresponsive', () => {
+    console.log('[APP] page unresponsive, reloading');
+    if (!waiting) retry();
+  });
+
+  win.on('closed', () => { stopWaiting(); clearTimeout(checkTimer); win = null; });
   start();
 }
 
