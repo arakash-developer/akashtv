@@ -45,6 +45,8 @@ function stopApp() {
 
 const page = (msg) => `<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AKASH TV</title>
+<link rel="icon" href="/icon.png"><link rel="apple-touch-icon" href="/icon.png">
+<link rel="manifest" href="/manifest.json?key=${KEY}"><meta name="theme-color" content="#111111">
 <body style="margin:0;background:#111;color:#fff;font:18px sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;gap:20px">
 <h2 style="margin:0">AKASH TV</h2>
 <p style="opacity:.7;margin:0">${msg}</p>
@@ -54,7 +56,20 @@ const page = (msg) => `<!doctype html><meta name="viewport" content="width=devic
 
 http.createServer((req, res) => {
   const u = new URL(req.url, 'http://x');
+  // App icon for the phone home-screen shortcut (not secret)
+  if (u.pathname === '/icon.png') {
+    res.writeHead(200, { 'Content-Type': 'image/png', 'Cache-Control': 'max-age=86400' });
+    return fs.createReadStream(path.join(ROOT, 'assets', 'icon.png')).pipe(res);
+  }
   if (u.searchParams.get('key') !== KEY) { res.writeHead(403); return res.end('Forbidden'); }
+  if (u.pathname === '/manifest.json') {
+    res.writeHead(200, { 'Content-Type': 'application/manifest+json' });
+    return res.end(JSON.stringify({
+      name: 'AKASH TV', short_name: 'AKASH TV', start_url: `/?key=${KEY}`, scope: '/',
+      display: 'standalone', background_color: '#111111', theme_color: '#111111',
+      icons: [{ src: '/icon.png', sizes: '256x256', type: 'image/png', purpose: 'any' }]
+    }));
+  }
   let msg = isRunning() ? 'Running' : 'Stopped';
   if (u.pathname === '/start') msg = startApp();
   else if (u.pathname === '/stop') msg = stopApp();
