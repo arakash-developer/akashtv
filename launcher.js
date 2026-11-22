@@ -162,6 +162,51 @@ function receiveUpload(req, res, rawName) {
   req.pipe(out);
 }
 
+// ---- Sound: output device + volume (via audio.ps1, kept running for fast replies) ----
+let audioProc = null, audioQueue = [], audioBuf = '';
+function audioCmd(cmd) {
+  return new Promise((resolve) => {
+    if (!audioProc) {
+      audioProc = spawn('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(ROOT, 'audio.ps1')], { windowsHide: true });
+      audioQueue = [{ resolve: () => {} }]; // first line = "ready"
+      audioBuf = '';
+      audioProc.stdout.setEncoding('utf8');
+      audioProc.stdout.on('data', (d) => {
+        audioBuf += d;
+        const lines = audioBuf.split(String.fromCharCode(10)); audioBuf = lines.pop();
+        for (const l of lines) {
+          if (!l.trim()) continue;
+          const job = audioQueue.shift();
+          let r; try { r = JSON.parse(l); } catch { r = { ok: false, error: 'bad reply' }; }
+          if (job) job.resolve(r);
+        }
+      });
+      audioProc.on('exit', () => { audioProc = null; audioQueue.splice(0).forEach((j) => j.resolve({ ok: false, error: 'audio helper stopped' })); });
+    }
+    audioQueue.push({ resolve });
+    audioProc.stdin.write(cmd + String.fromCharCode(10), 'utf8');
+  });
+}
+
+// ---- Display: which monitor the TV app opens on (saved in pairings/settings.json, read by main.js) ----
+const SETTINGS = path.join(ROOT, 'pairings', 'settings.json');
+const readSettings = () => { try { return JSON.parse(fs.readFileSync(SETTINGS, 'utf8')); } catch { return {}; } };
+const writeSettings = (s) => fs.writeFileSync(SETTINGS, JSON.stringify(s, null, 2));
+function listDisplays() {
+  return new Promise((resolve) => {
+    const ps = 'Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Screen]::AllScreens | ForEach-Object { [pscustomobject]@{ name = $_.DeviceName; primary = $_.Primary; x = $_.Bounds.X; y = $_.Bounds.Y; width = $_.Bounds.Width; height = $_.Bounds.Height } } | ConvertTo-Json -Compress';
+    execFile('powershell', ['-NoProfile', '-Command', ps], { windowsHide: true }, (e, out) => {
+      let list = [];
+      try { list = JSON.parse(out); if (!Array.isArray(list)) list = [list]; } catch {}
+      const chosen = readSettings().display;
+      resolve(list.map((d, i) => ({
+        ...d, index: i + 1, name: 'Display ' + (i + 1) + (d.primary ? ' (main)' : ''),
+        selected: chosen ? chosen.x === d.x && chosen.y === d.y : d.primary
+      })));
+    });
+  });
+}
+
 // ---- "Send to AKASH TV" (right-click on any PC file) -> shows up on the phone ----
 const SHARED_FILE = path.join(ROOT, 'pairings', 'shared.json');
 let shared = [];
@@ -213,6 +258,9 @@ const POWER = {
 };
 
 const ICONS = {
+  sound: '<path d="M4 9h4l5-4v14l-5-4H4z"/><path d="M16 8.5a5 5 0 0 1 0 7M18.5 6a8.5 8.5 0 0 1 0 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>',
+  mute:  '<path d="M4 9h4l5-4v14l-5-4H4z"/><path d="M16 9l6 6M22 9l-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>',
+  display: '<path d="M3 4h18a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1h-7v2h3v2H7v-2h3v-2H3a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1zm1 2v9h16V6z"/>',
   file:  '<path d="M6 2h8l6 6v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2zm7 1.5V9h5.5zM8 13v2h8v-2zm0 4v2h5v-2z"/>',
   up:    '<path d="M12 3l6 6h-4v6h-4V9H6zM4 19h16v2H4z"/>',
   down:  '<path d="M10 3h4v6h4l-6 6-6-6h4zM4 19h16v2H4z"/>',
@@ -255,6 +303,23 @@ const page = (msg) => `<!doctype html><meta name="viewport" content="width=devic
   #msg.on i{background:#2ecc71} #msg.load i{background:#f5a623}
   #clips{display:none;padding:16px 16px 110px;max-width:640px;margin:0 auto}
   body.clipview main{display:none} body.clipview #clips{display:block}
+  .pane{display:none;padding:16px 16px 110px;max-width:640px;margin:0 auto}
+  body.view-sound main,body.view-display main{display:none}
+  body.view-sound #sound,body.view-display #display{display:block}
+  .pane header{display:flex;align-items:center;justify-content:space-between;margin:4px 0 14px}
+  .pane h2{font-size:22px;margin:0} .pane header small{opacity:.6;font-size:13px}
+  .hint{opacity:.6;font-size:14px;margin:0 0 14px}
+  .volbox{display:flex;align-items:center;gap:12px;background:#1c1c1c;border:1px solid #2a2a2a;border-radius:14px;padding:14px}
+  .volbox input{flex:1;accent-color:#e0102e;height:28px}
+  .volbox b{width:40px;text-align:right;font-size:18px}
+  .mutebtn{background:#2a2a2a;border:0;color:#fff;border-radius:50%;width:46px;height:46px;display:flex;align-items:center;justify-content:center;flex:none}
+  .mutebtn.on{background:#e0102e}
+  .opt{display:flex;align-items:center;gap:12px;width:100%;text-align:left;background:#1c1c1c;border:1px solid #2a2a2a;color:#fff;border-radius:12px;padding:14px;margin-bottom:8px;font-size:15px}
+  .opt .dot{width:20px;height:20px;border-radius:50%;border:2px solid #666;flex:none}
+  .opt.sel{border-color:#e0102e;background:#241316} .opt.sel .dot{border-color:#e0102e;background:radial-gradient(#e0102e 45%,transparent 50%)}
+  .opt small{display:block;opacity:.55;font-size:12px;margin-top:2px}
+  .opt:disabled{opacity:.5}
+  nav button{min-width:0;font-size:11px}
   #files{display:none;padding:16px 16px 110px;max-width:640px;margin:0 auto}
   body.fileview main{display:none} body.fileview #files{display:block}
   #files header{display:flex;align-items:center;justify-content:space-between;margin:4px 0 14px}
@@ -270,7 +335,7 @@ const page = (msg) => `<!doctype html><meta name="viewport" content="width=devic
   .bar{height:6px;background:#333;border-radius:4px;margin-top:6px;overflow:hidden} .bar i{display:block;height:100%;width:0;background:#e0102e;transition:width .2s}
   .frow.done .bar i{background:#1f8f4e} .frow.err .bar i{background:#888}
   .empty-s{opacity:.5;font-size:14px;margin:4px 2px}
-  #toast{position:fixed;left:16px;right:16px;bottom:96px;background:#1f8f4e;color:#fff;padding:12px 16px;border-radius:12px;font-size:15px;text-align:center;opacity:0;transform:translateY(10px);transition:.25s;pointer-events:none}
+  #toast{position:fixed;left:16px;right:16px;bottom:96px;background:#1f8f4e;color:#fff;padding:12px 16px;border-radius:12px;font-size:15px;text-align:center;overflow-wrap:anywhere;opacity:0;transform:translateY(10px);transition:.25s;pointer-events:none}
   #toast.show{opacity:1;transform:none}
   #clips header{display:flex;align-items:center;justify-content:space-between;margin:4px 0 14px}
   #clips h2{font-size:22px} #clips header small{opacity:.6;font-size:13px}
@@ -306,6 +371,21 @@ const page = (msg) => `<!doctype html><meta name="viewport" content="width=devic
   <p id="msg"><i></i><span>${msg}</span></p>
   <button class="big" id="bigbtn" onclick="act(running ? 'stop' : 'start')"></button>
 </main>
+<section id="sound" class="pane">
+  <header><h2>Sound</h2><small id="sound-upd"></small></header>
+  <div class="volbox">
+    <button id="mute-btn" class="mutebtn" onclick="toggleMute()"></button>
+    <input type="range" id="vol" min="0" max="100" step="1" oninput="volInput(this.value)">
+    <b id="vol-num">--</b>
+  </div>
+  <h3 class="sec">Play sound through</h3>
+  <div id="dev-list"><p class="empty-s">Loading...</p></div>
+</section>
+<section id="display" class="pane">
+  <header><h2>Display</h2><small id="display-upd"></small></header>
+  <p class="hint">AKASH TV opens on the selected screen. If it is running, it moves there right away.</p>
+  <div id="disp-list"><p class="empty-s">Loading...</p></div>
+</section>
 <section id="files">
   <header><h2>Files</h2><small id="files-upd"></small></header>
   <label class="upload">
@@ -330,6 +410,8 @@ const page = (msg) => `<!doctype html><meta name="viewport" content="width=devic
   <button id="nav-home" onclick="act('status')">${svg('home')}Home</button>
   <button id="nav-clip" onclick="showClips(true)">${svg('clip')}Clipboard</button>
   <button id="nav-files" onclick="showFiles(true)">${svg('file')}Files</button>
+  <button id="nav-sound" onclick="showPane('sound')">${svg('sound')}Sound</button>
+  <button id="nav-display" onclick="showPane('display')">${svg('display')}Display</button>
   <button class="power" onclick="sheet(true)">${svg('power')}Power</button>
 </nav>
 <div id="sheet" onclick="if(event.target===this)sheet(false)">
@@ -377,6 +459,7 @@ const page = (msg) => `<!doctype html><meta name="viewport" content="width=devic
     if (document.body.classList.contains('busy')) return;
     if (document.body.classList.contains('clipview')) showClips(false);
     if (document.body.classList.contains('fileview')) showFiles(false);
+    closePane();
     setBusy(true, a);
     setStatus(LOADING[a], 'load');
     const t0 = Date.now();
@@ -401,7 +484,7 @@ const page = (msg) => `<!doctype html><meta name="viewport" content="width=devic
   let filesTimer = null;
   const fmtSize = (b) => b < 1024 ? b + ' B' : b < 1048576 ? (b / 1024).toFixed(0) + ' KB' : b < 1073741824 ? (b / 1048576).toFixed(1) + ' MB' : (b / 1073741824).toFixed(2) + ' GB';
   function showFiles(on) {
-    if (on) showClips(false);
+    if (on) { closePane(); showClips(false); }
     document.body.classList.toggle('fileview', on);
     document.getElementById('nav-files').classList.toggle('active', on);
     if (on && location.hash !== '#files') history.replaceState(null, '', '#files');
@@ -473,7 +556,84 @@ const page = (msg) => `<!doctype html><meta name="viewport" content="width=devic
     filesSig = ''; loadFiles();
   }
 
+  // ---- Sound / Display panes ----
+  let pane = null, paneTimer = null;
+  function closePane() {
+    if (!pane) return;
+    document.body.classList.remove('view-' + pane);
+    document.getElementById('nav-' + pane).classList.remove('active');
+    clearInterval(paneTimer); pane = null;
+    if (location.hash === '#sound' || location.hash === '#display') history.replaceState(null, '', location.pathname + location.search);
+  }
+  function showPane(name) {
+    if (document.body.classList.contains('clipview')) showClips(false);
+    if (document.body.classList.contains('fileview')) showFiles(false);
+    closePane();
+    pane = name;
+    document.body.classList.add('view-' + name);
+    document.getElementById('nav-' + name).classList.add('active');
+    history.replaceState(null, '', '#' + name);
+    const load = name === 'sound' ? loadSound : loadDisplays;
+    load(); paneTimer = setInterval(load, name === 'sound' ? 3000 : 6000);
+  }
+
+  let snd = null, volTimer = null, volDragging = 0;
+  function renderSound(r) {
+    if (!r || !r.ok) { document.getElementById('sound-upd').textContent = (r && r.error) || 'Sound not available'; return; }
+    snd = r;
+    document.getElementById('sound-upd').textContent = 'Updated ' + new Date().toLocaleTimeString();
+    if (Date.now() - volDragging > 1500) { document.getElementById('vol').value = r.volume; document.getElementById('vol-num').textContent = r.volume; }
+    const mb = document.getElementById('mute-btn');
+    mb.innerHTML = r.mute ? ${JSON.stringify(svg('mute', 22))} : ${JSON.stringify(svg('sound', 22))};
+    mb.classList.toggle('on', r.mute);
+    const list = document.getElementById('dev-list'); list.innerHTML = '';
+    r.devices.forEach((d) => {
+      const b = document.createElement('button'); b.className = 'opt' + (d.isDefault ? ' sel' : '');
+      b.innerHTML = '<span class="dot"></span><span></span>'; b.lastChild.textContent = d.name;
+      b.onclick = async () => {
+        if (d.isDefault) return;
+        document.querySelectorAll('#dev-list .opt').forEach((x) => (x.disabled = true));
+        toast('Switching to ' + d.name);
+        renderSound(await api('/audio?device=' + encodeURIComponent(d.id)));
+      };
+      list.appendChild(b);
+    });
+  }
+  async function loadSound() { try { renderSound(await api('/audio')); } catch { document.getElementById('sound-upd').textContent = 'PC not reachable'; } }
+  function volInput(v) {
+    volDragging = Date.now();
+    document.getElementById('vol-num').textContent = v;
+    clearTimeout(volTimer);
+    volTimer = setTimeout(async () => renderSound(await api('/audio?volume=' + v)), 120);
+  }
+  async function toggleMute() { if (snd) renderSound(await api('/audio?mute=' + (snd.mute ? 0 : 1))); }
+
+  async function loadDisplays() {
+    try {
+      const r = await api('/displays');
+      document.getElementById('display-upd').textContent = 'Updated ' + new Date().toLocaleTimeString();
+      renderDisplays(r.displays);
+    } catch { document.getElementById('display-upd').textContent = 'PC not reachable'; }
+  }
+  function renderDisplays(list) {
+    const el = document.getElementById('disp-list'); el.innerHTML = '';
+    if (!list.length) { el.innerHTML = '<p class="empty-s">No displays found.</p>'; return; }
+    list.forEach((d) => {
+      const b = document.createElement('button'); b.className = 'opt' + (d.selected ? ' sel' : '');
+      b.innerHTML = '<span class="dot"></span><span><span></span><small></small></span>';
+      b.querySelector('span span').textContent = d.name;
+      b.querySelector('small').textContent = d.width + ' × ' + d.height;
+      b.onclick = async () => {
+        if (d.selected) return;
+        toast('AKASH TV will use ' + d.name);
+        renderDisplays((await api('/displays?select=' + d.index)).displays);
+      };
+      el.appendChild(b);
+    });
+  }
+
   function showClips(on) {
+    if (on) closePane();
     if (on && document.body.classList.contains('fileview')) showFiles(false);
     document.body.classList.toggle('clipview', on);
     document.getElementById('nav-clip').classList.toggle('active', on);
@@ -597,6 +757,7 @@ const page = (msg) => `<!doctype html><meta name="viewport" content="width=devic
 
   if (location.hash === '#clips') showClips(true);
   if (location.hash === '#files') showFiles(true);
+  if (location.hash === '#sound' || location.hash === '#display') showPane(location.hash.slice(1));
 
   // ---- Auto-download: files sent from the PC start downloading by themselves while this page is open ----
   let seen = null;
@@ -672,6 +833,31 @@ http.createServer((req, res) => {
   if (u.pathname === '/files') {
     res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
     return res.end(JSON.stringify({ files: listDownloads(), shared: sharedList() }));
+  }
+  const sendJSON = (o) => { res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(o)); };
+  if (u.pathname === '/audio') {
+    const a = u.searchParams;
+    let cmd = 'vol';
+    if (a.has('device')) cmd = 'set ' + a.get('device').replace(/[^A-Za-z0-9{}.-]/g, '');
+    else if (a.has('volume')) cmd = 'setvol ' + Math.max(0, Math.min(100, parseInt(a.get('volume'), 10) || 0));
+    else if (a.has('mute')) cmd = 'mute ' + (a.get('mute') === '1' ? 1 : 0);
+    audioCmd(cmd).then(sendJSON);
+    return;
+  }
+  if (u.pathname === '/displays') {
+    const want = u.searchParams.get('select');
+    listDisplays().then((list) => {
+      if (want) {
+        const d = list.find((x) => String(x.index) === want);
+        if (d) {
+          writeSettings({ ...readSettings(), display: { x: d.x, y: d.y, width: d.width, height: d.height } });
+          list.forEach((x) => (x.selected = x === d));
+          console.log('[DISPLAY] selected', d.name);
+        }
+      }
+      sendJSON({ displays: list });
+    });
+    return;
   }
   if (u.pathname === '/shared') {
     touch();

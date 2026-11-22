@@ -1,4 +1,4 @@
-const { app, BrowserWindow, globalShortcut, net, session } = require('electron');
+const { app, BrowserWindow, globalShortcut, net, session, screen } = require('electron');
 const fs = require('fs');
 const path = require('path');
 
@@ -176,9 +176,40 @@ async function start() {
   tryCurrentUA();
 }
 
+// ---- Which monitor to open on (chosen from the phone, saved by launcher.js) ----
+const settingsPath = () => path.join(app.getPath('userData'), 'settings.json');
+function chosenDisplay() {
+  let want = null;
+  try { want = JSON.parse(fs.readFileSync(settingsPath(), 'utf8')).display; } catch {}
+  const all = screen.getAllDisplays();
+  if (!want) return screen.getPrimaryDisplay();
+  // Windows reports physical pixels, Electron may use scaled ones: match by the monitor's top-left corner
+  return all.find((d) => d.bounds.x === want.x && d.bounds.y === want.y)
+    || screen.getDisplayNearestPoint({ x: want.x + 10, y: want.y + 10 })
+    || screen.getPrimaryDisplay();
+}
+function moveToChosenDisplay() {
+  if (!win) return;
+  const d = chosenDisplay();
+  const wasFull = win.isFullScreen();
+  if (wasFull) win.setFullScreen(false);
+  win.setBounds({ x: d.bounds.x + 50, y: d.bounds.y + 50, width: 1280, height: 720 });
+  if (wasFull) setTimeout(() => win && win.setFullScreen(true), 300);
+  console.log('[DISPLAY] using display at', d.bounds.x, d.bounds.y);
+}
+// Follow changes made from the phone while the app is running
+let lastDisplaySetting; // undefined until first check
+setInterval(() => {
+  let cur = 'null';
+  try { cur = JSON.stringify(JSON.parse(fs.readFileSync(settingsPath(), 'utf8')).display || null); } catch {}
+  if (lastDisplaySetting !== undefined && cur !== lastDisplaySetting) moveToChosenDisplay();
+  lastDisplaySetting = cur;
+}, 2000);
+
 function createWindow() {
+  const disp = chosenDisplay();
   win = new BrowserWindow({
-    title: 'AKASH TV', icon: path.join(__dirname, 'assets', 'icon.png'), width: 1280, height: 720, fullscreen: true, autoHideMenuBar: true, backgroundColor: '#000000',
+    title: 'AKASH TV', icon: path.join(__dirname, 'assets', 'icon.png'), x: disp.bounds.x + 50, y: disp.bounds.y + 50, width: 1280, height: 720, fullscreen: true, autoHideMenuBar: true, backgroundColor: '#000000',
     webPreferences: { nodeIntegration: false, contextIsolation: true, sandbox: true, backgroundThrottling: false }
   });
   win.on('page-title-updated', (e) => e.preventDefault()); // keep "AKASH TV" as window title
