@@ -192,8 +192,13 @@ function sendDownload(res, rawName, id) {
   let st;
   try { st = full && fs.statSync(full); } catch {}
   if (!st || !st.isFile()) { res.writeHead(404); return res.end('File not found'); }
+  // Real file type (instead of a generic one) so the phone browser treats it as a normal file
+  const MIME = { '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.gif': 'image/gif', '.webp': 'image/webp',
+    '.mp4': 'video/mp4', '.mkv': 'video/x-matroska', '.mp3': 'audio/mpeg', '.pdf': 'application/pdf', '.txt': 'text/plain',
+    '.zip': 'application/zip', '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', '.apk': 'application/vnd.android.package-archive' };
   res.writeHead(200, {
-    'Content-Type': 'application/octet-stream',
+    'Content-Type': MIME[path.extname(full).toLowerCase()] || 'application/octet-stream',
     'Content-Length': st.size,
     'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(path.basename(full))}`
   });
@@ -265,6 +270,8 @@ const page = (msg) => `<!doctype html><meta name="viewport" content="width=devic
   .bar{height:6px;background:#333;border-radius:4px;margin-top:6px;overflow:hidden} .bar i{display:block;height:100%;width:0;background:#e0102e;transition:width .2s}
   .frow.done .bar i{background:#1f8f4e} .frow.err .bar i{background:#888}
   .empty-s{opacity:.5;font-size:14px;margin:4px 2px}
+  #toast{position:fixed;left:16px;right:16px;bottom:96px;background:#1f8f4e;color:#fff;padding:12px 16px;border-radius:12px;font-size:15px;text-align:center;opacity:0;transform:translateY(10px);transition:.25s;pointer-events:none}
+  #toast.show{opacity:1;transform:none}
   #clips header{display:flex;align-items:center;justify-content:space-between;margin:4px 0 14px}
   #clips h2{font-size:22px} #clips header small{opacity:.6;font-size:13px}
   .clip{background:#1c1c1c;border:1px solid #2a2a2a;border-radius:14px;padding:12px 12px 10px;margin-bottom:10px}
@@ -591,6 +598,40 @@ const page = (msg) => `<!doctype html><meta name="viewport" content="width=devic
   if (location.hash === '#clips') showClips(true);
   if (location.hash === '#files') showFiles(true);
 
+  // ---- Auto-download: files sent from the PC start downloading by themselves while this page is open ----
+  let seen = null;
+  try { seen = JSON.parse(localStorage.getItem('akashtv-seen') || 'null'); } catch {}
+  const saveSeen = () => { try { localStorage.setItem('akashtv-seen', JSON.stringify(seen.slice(-300))); } catch {} };
+  function toast(text) {
+    let t = document.getElementById('toast');
+    if (!t) { t = document.createElement('div'); t.id = 'toast'; document.body.appendChild(t); }
+    t.textContent = text; t.classList.add('show');
+    clearTimeout(t._h); t._h = setTimeout(() => t.classList.remove('show'), 3500);
+  }
+  function startDownload(f) {
+    const a = document.createElement('a');
+    a.href = '/download?id=' + f.id + '&key=' + KEY; a.setAttribute('download', f.name);
+    document.body.appendChild(a); a.click(); a.remove();
+  }
+  async function checkShared() {
+    if (document.visibilityState !== 'visible') return;
+    try {
+      const { shared: list } = await api('/shared');
+      if (seen === null) { seen = list.map((f) => f.id); return saveSeen(); } // first visit: don't download old ones
+      const fresh = list.filter((f) => !seen.includes(f.id)).reverse();
+      for (const f of fresh) {
+        seen.push(f.id);
+        toast('Downloading ' + f.name + ' from PC');
+        startDownload(f);
+        await sleepMs(800); // small gap so the browser accepts several downloads
+      }
+      if (fresh.length) { saveSeen(); if (document.body.classList.contains('fileview')) { filesSig = ''; loadFiles(); } }
+    } catch {}
+  }
+  checkShared();
+  setInterval(checkShared, 2500);
+  document.addEventListener('visibilitychange', checkShared);
+
   // Heartbeat: PC tracks the clipboard only while this page is open and visible
   let hb = null;
   const ping = () => fetch('/ping?key=' + KEY).catch(() => {});
@@ -631,6 +672,11 @@ http.createServer((req, res) => {
   if (u.pathname === '/files') {
     res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
     return res.end(JSON.stringify({ files: listDownloads(), shared: sharedList() }));
+  }
+  if (u.pathname === '/shared') {
+    touch();
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    return res.end(JSON.stringify({ shared: sharedList() }));
   }
   if (u.pathname === '/upload' && req.method === 'PUT') return receiveUpload(req, res, u.searchParams.get('name'));
   if (u.pathname === '/download') return sendDownload(res, u.searchParams.get('name'), u.searchParams.get('id'));
