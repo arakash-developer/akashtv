@@ -162,6 +162,8 @@ const page = (msg) => `<!doctype html><meta name="viewport" content="width=devic
   .clip .meta span{opacity:.6}
   .clip button{background:#2a2a2a;color:#fff;border:0;border-radius:10px;padding:8px 14px;font-size:14px}
   .clip button.done{background:#1f8f4e}
+  .clip pre a{color:#6fb4ff;text-decoration:underline;word-break:break-all}
+  .clip .meta a.open{background:#1d4f8a;color:#fff;text-decoration:none;border-radius:10px;padding:8px 14px;font-size:14px;margin-left:auto;margin-right:8px}
   .tag{display:inline-block;font-size:11px;font-weight:600;padding:2px 8px;border-radius:20px;margin-right:6px;opacity:1!important}
   .tag.pc{background:#26405e;color:#9cc8ff} .tag.phone{background:#4a2a12;color:#ffb36b}
   .sendbox{background:#1c1c1c;border:1px solid #2a2a2a;border-radius:14px;padding:10px;margin-bottom:16px}
@@ -297,6 +299,32 @@ const page = (msg) => `<!doctype html><meta name="viewport" content="width=devic
       updTimes();
     } catch { document.getElementById('clip-upd').textContent = 'PC not reachable'; }
   }
+  // Turn URLs in text into clickable links (built with DOM nodes, so clip text can't inject HTML)
+  const URL_RE = /(https?:\\/\\/[^\\s<>"']+|www\\.[^\\s<>"']+)/gi;
+  const cleanURL = (u) => u.replace(/[.,;:!?)\\]}]+$/, '');
+  const hrefOf = (u) => (/^https?:\\/\\//i.test(u) ? u : 'https://' + u);
+  function linkify(el, text) {
+    el.textContent = '';
+    let last = 0;
+    text.replace(URL_RE, (m, _g, idx) => {
+      const url = cleanURL(m);
+      el.appendChild(document.createTextNode(text.slice(last, idx)));
+      const a = document.createElement('a');
+      a.href = hrefOf(url); a.textContent = url; a.target = '_blank'; a.rel = 'noopener noreferrer';
+      el.appendChild(a);
+      last = idx + url.length;
+      return m;
+    });
+    el.appendChild(document.createTextNode(text.slice(last)));
+  }
+  // The clip is just one link -> show an "Open" button too
+  function soleURL(text) {
+    const t = text.trim();
+    if (/\\s/.test(t)) return null;
+    const m = t.match(URL_RE);
+    return m && cleanURL(m[0]) === t ? hrefOf(t) : null;
+  }
+
   function updTimes() {
     document.querySelectorAll('.clip .meta span').forEach((s) => (s.textContent = ago(+s.dataset.t)));
     document.getElementById('clip-upd').textContent = 'Updated ' + new Date().toLocaleTimeString();
