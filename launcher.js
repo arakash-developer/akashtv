@@ -72,16 +72,40 @@ while ($true) {
     buf += d;
     const lines = buf.split(String.fromCharCode(10)).map((x) => x.trim()); buf = lines.pop();
     for (const l of lines) {
-      if (!l.trim()) continue;
-      const text = Buffer.from(l.trim(), 'base64').toString('utf8');
-      const i = clips.findIndex((c) => c.text === text);
-      if (i >= 0) clips.splice(i, 1);
-      clips.unshift({ text, at: Date.now() });
-      clips.length = Math.min(clips.length, MAX_CLIPS);
+      if (!l) continue;
+      const text = Buffer.from(l, 'base64').toString('utf8');
+      pcText = text;
+      // Text we just put there from the phone: don't record it again as a PC copy (no loop)
+      if (text === fromPhone) { fromPhone = null; continue; }
+      addClip(text, 'pc');
     }
   });
   p.on('exit', () => { if (watcher === p) { watcher = null; } }); // touch() restarts it if still needed
 }
+
+let pcText = null;    // what is on the PC clipboard right now (as far as we know)
+let fromPhone = null; // last text the phone pushed to the PC
+
+function addClip(text, from) {
+  const i = clips.findIndex((c) => c.text === text);
+  if (i >= 0) clips.splice(i, 1);
+  clips.unshift({ text, from, at: Date.now() });
+  clips.length = Math.min(clips.length, MAX_CLIPS);
+}
+
+// Phone -> PC clipboard. Text goes through stdin, so any characters are safe.
+function setPCClipboard(text) {
+  if (text === pcText) return false;            // already there: nothing to do (no loop / duplicate)
+  fromPhone = text; pcText = text;
+  const p = spawn('powershell', ['-NoProfile', '-STA', '-Command',
+    '[Console]::InputEncoding = [Text.Encoding]::UTF8; Set-Clipboard -Value ([Console]::In.ReadToEnd())'], { windowsHide: true });
+  p.stdin.end(text, 'utf8');
+  addClip(text, 'phone');
+  console.log('[CLIP] phone -> PC (' + text.length + ' chars)');
+  return true;
+}
+
+const MAX_SEND = 100000; // chars
 
 // PC power actions (small delay so the phone gets the reply first)
 const POWER = {
@@ -138,6 +162,14 @@ const page = (msg) => `<!doctype html><meta name="viewport" content="width=devic
   .clip .meta span{opacity:.6}
   .clip button{background:#2a2a2a;color:#fff;border:0;border-radius:10px;padding:8px 14px;font-size:14px}
   .clip button.done{background:#1f8f4e}
+  .tag{display:inline-block;font-size:11px;font-weight:600;padding:2px 8px;border-radius:20px;margin-right:6px;opacity:1!important}
+  .tag.pc{background:#26405e;color:#9cc8ff} .tag.phone{background:#4a2a12;color:#ffb36b}
+  .sendbox{background:#1c1c1c;border:1px solid #2a2a2a;border-radius:14px;padding:10px;margin-bottom:16px}
+  .sendbox textarea{width:100%;background:#111;color:#fff;border:1px solid #333;border-radius:10px;padding:10px;font:15px system-ui,sans-serif;resize:vertical}
+  .sendrow{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:8px}
+  .sendrow small{opacity:.6;font-size:12px}
+  .sendrow button{background:#e0102e;color:#fff;border:0;border-radius:10px;padding:10px 16px;font-size:15px;font-weight:600;white-space:nowrap}
+  .sendrow button:disabled{opacity:.5}
   .empty{opacity:.6;text-align:center;margin-top:30vh}
   nav button.active{color:#fff}
   #confirm{position:fixed;inset:0;background:rgba(0,0,0,.7);display:none;align-items:center;justify-content:center;padding:16px}
@@ -155,7 +187,11 @@ const page = (msg) => `<!doctype html><meta name="viewport" content="width=devic
   <button class="big" id="bigbtn" onclick="act(running ? 'stop' : 'start')"></button>
 </main>
 <section id="clips">
-  <header><h2>PC Clipboard</h2><small id="clip-upd"></small></header>
+  <header><h2>Clipboard</h2><small id="clip-upd"></small></header>
+  <div class="sendbox">
+    <textarea id="send-text" rows="3" placeholder="Paste or type text to send to the PC"></textarea>
+    <div class="sendrow"><small id="send-msg">Phone copies sync automatically when allowed</small><button id="send-btn" onclick="sendText()">Send to PC</button></div>
+  </div>
   <div id="clip-list"><p class="empty">Loading...</p></div>
 </section>
 <nav>
@@ -245,8 +281,15 @@ const page = (msg) => `<!doctype html><meta name="viewport" content="width=devic
       list.innerHTML = '';
       clipData.forEach((c) => {
         const d = document.createElement('div'); d.className = 'clip';
-        d.innerHTML = '<pre></pre><div class="meta"><span></span><button>Copy</button></div>';
-        d.querySelector('pre').textContent = c.text;
+        d.innerHTML = '<pre></pre><div class="meta"><div><b class="tag"></b><span></span></div><button>Copy</button></div>';
+        linkify(d.querySelector('pre'), c.text);
+        const only = soleURL(c.text);
+        if (only) {
+          const o = document.createElement('a'); o.className = 'open'; o.textContent = 'Open';
+          o.href = only; o.target = '_blank'; o.rel = 'noopener noreferrer';
+          d.querySelector('.meta').insertBefore(o, d.querySelector('.meta button'));
+        }
+        const tag = d.querySelector('.tag'); tag.textContent = c.from === 'phone' ? 'Phone' : 'PC'; tag.classList.add(c.from || 'pc');
         d.querySelector('span').dataset.t = c.at;
         d.querySelector('button').onclick = (e) => copyText(c.text, e.target);
         list.appendChild(d);
@@ -271,6 +314,50 @@ const page = (msg) => `<!doctype html><meta name="viewport" content="width=devic
     btn.textContent = ok ? 'Copied ✓' : 'Copy failed'; btn.classList.toggle('done', ok);
     setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('done'); }, 1500);
   }
+  // ---- Phone -> PC ----
+  // Anti-loop: never send back text that is already in the list (came from the PC or was sent already)
+  let lastPhoneText = null;
+  try { lastPhoneText = localStorage.getItem('akashtv-last-phone'); } catch {}
+  const known = (t) => t === lastPhoneText || clipData.some((c) => c.text === t);
+
+  async function pushToPC(text) {
+    const r = await (await fetch('/send?key=' + KEY, { method: 'POST', headers: { 'Content-Type': 'text/plain; charset=utf-8' }, body: text })).json();
+    lastPhoneText = text;
+    try { localStorage.setItem('akashtv-last-phone', text); } catch {}
+    loadClips();
+    return r;
+  }
+
+  async function sendText() {
+    const ta = document.getElementById('send-text'), btn = document.getElementById('send-btn'), m = document.getElementById('send-msg');
+    const text = ta.value;
+    if (!text.trim()) { m.textContent = 'Type or paste something first'; return; }
+    btn.disabled = true; btn.textContent = 'Sending...';
+    try { const r = await pushToPC(text); m.textContent = r.msg; if (r.ok || r.msg.startsWith('Already')) ta.value = ''; }
+    catch { m.textContent = 'PC not reachable'; }
+    btn.disabled = false; btn.textContent = 'Send to PC';
+  }
+
+  // Auto: when the page opens / comes back to front, read the phone clipboard and send it if it is new.
+  // Browsers only allow this on https (or with permission), so it silently does nothing otherwise.
+  let syncing = false;
+  async function autoSync() {
+    if (syncing || document.visibilityState !== 'visible' || !navigator.clipboard || !navigator.clipboard.readText) return;
+    syncing = true;
+    try {
+      if (!clipData.length) await loadClips();
+      const t = await navigator.clipboard.readText();
+      if (t && t.trim() && !known(t)) {
+        const r = await pushToPC(t);
+        if (r.ok) document.getElementById('send-msg').textContent = 'Phone clipboard sent to PC';
+      }
+    } catch {}
+    syncing = false;
+  }
+  document.addEventListener('visibilitychange', autoSync);
+  window.addEventListener('focus', autoSync);
+  autoSync();
+
   if (location.hash === '#clips') showClips(true);
 
   // Heartbeat: PC tracks the clipboard only while this page is open and visible
@@ -314,6 +401,19 @@ http.createServer((req, res) => {
     touch();
     res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
     return res.end(JSON.stringify({ clips }));
+  }
+  // Phone -> PC clipboard (POST body = plain text)
+  if (u.pathname === '/send' && req.method === 'POST') {
+    touch();
+    let body = '';
+    req.setEncoding('utf8');
+    req.on('data', (c) => { body += c; if (body.length > MAX_SEND) req.destroy(); });
+    req.on('end', () => {
+      const ok = body.length > 0 && setPCClipboard(body);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok, msg: ok ? 'Sent to PC clipboard' : body ? 'Already on PC clipboard' : 'Nothing to send' }));
+    });
+    return;
   }
   if (u.pathname === '/clipboard') u.pathname = '/'; // direct link: /clipboard?key=... opens the page (use #clips)
   if (u.pathname === '/manifest.json') {
