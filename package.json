@@ -6,7 +6,9 @@
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "dist": "electron-builder"
+    "dist": "electron-builder",
+    "icon": "electron scripts/make-icon.js",
+    "shortcut": "powershell -ExecutionPolicy Bypass -File create-shortcut.ps1"
   },
   "devDependencies": {
     "electron": "^33.0.0",
@@ -14,6 +16,7 @@
   },
   "build": {
     "appId": "com.akash.akashtv",
+    "icon": "assets/icon.png",
     "productName": "AKASH TV",
     "win": { "target": "nsis" },
     "linux": { "target": "AppImage" },
