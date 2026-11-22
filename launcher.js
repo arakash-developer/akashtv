@@ -43,6 +43,46 @@ function stopApp() {
   return 'AKASH TV stopped';
 }
 
+// ---- PC clipboard history (text only, kept in memory, newest first) ----
+const clips = [];
+const MAX_CLIPS = 50;
+let watcher = null, lastSeen = 0;
+// Tracking runs only while someone has the page open (page pings every few seconds)
+function touch() {
+  lastSeen = Date.now();
+  if (!watcher) { console.log('[CLIP] tracking ON'); watchClipboard(); }
+}
+setInterval(() => {
+  if (watcher && Date.now() - lastSeen > 10000) {
+    console.log('[CLIP] tracking OFF');
+    const w = watcher; watcher = null; w.kill();
+  }
+}, 2000);
+function watchClipboard() {
+  const ps = `Add-Type -AssemblyName System.Windows.Forms; $last = '';
+while ($true) {
+  try { $t = [System.Windows.Forms.Clipboard]::GetText() } catch { $t = '' }
+  if ($t -and $t -ne $last) { $last = $t; [Console]::Out.WriteLine([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($t))); [Console]::Out.Flush() }
+  Start-Sleep -Milliseconds 1000
+}`;
+  const p = spawn('powershell', ['-NoProfile', '-STA', '-Command', ps], { windowsHide: true });
+  watcher = p;
+  let buf = '';
+  p.stdout.on('data', (d) => {
+    buf += d;
+    const lines = buf.split(String.fromCharCode(10)).map((x) => x.trim()); buf = lines.pop();
+    for (const l of lines) {
+      if (!l.trim()) continue;
+      const text = Buffer.from(l.trim(), 'base64').toString('utf8');
+      const i = clips.findIndex((c) => c.text === text);
+      if (i >= 0) clips.splice(i, 1);
+      clips.unshift({ text, at: Date.now() });
+      clips.length = Math.min(clips.length, MAX_CLIPS);
+    }
+  });
+  p.on('exit', () => { if (watcher === p) { watcher = null; } }); // touch() restarts it if still needed
+}
+
 // PC power actions (small delay so the phone gets the reply first)
 const POWER = {
   sleep:    { msg: 'PC is going to sleep',  run: () => execFile('rundll32.exe', ['powrprof.dll,SetSuspendState', '0,1,0']) },
@@ -51,6 +91,7 @@ const POWER = {
 };
 
 const ICONS = {
+  clip:  '<path d="M9 3h6a1 1 0 0 1 1 1v1h2a2 2 0 0 1 2 2v13a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2V4a1 1 0 0 1 1-1zm0 2v2h6V5zm-1 6v2h8v-2zm0 4v2h6v-2z"/>',
   home:  '<path d="M3 11l9-8 9 8v10h-6v-6H9v6H3z"/>',
   play:  '<path d="M7 4l14 8-14 8z"/>',
   stop:  '<rect x="5" y="5" width="14" height="14" rx="2"/>',
@@ -79,6 +120,26 @@ const page = (msg) => `<!doctype html><meta name="viewport" content="width=devic
   #sheet .box{width:100%;background:#1c1c1c;border-radius:20px 20px 0 0;padding:20px 16px calc(20px + env(safe-area-inset-bottom));display:flex;justify-content:space-around}
   #sheet button{display:flex;flex-direction:column;align-items:center;gap:8px;background:none;border:0;color:#fff;font-size:14px;width:30%}
   #sheet button span{width:64px;height:64px;border-radius:50%;display:flex;align-items:center;justify-content:center;background:#2a2a2a}
+  .big.stop{background:#333}
+  .spin{width:22px;height:22px;border:3px solid rgba(255,255,255,.35);border-top-color:#fff;border-radius:50%;animation:r .8s linear infinite}
+  @keyframes r{to{transform:rotate(360deg)}}
+  body.busy .big,body.busy nav button{opacity:.45;pointer-events:none}
+  body.busy .big{opacity:.8}
+  #msg{display:flex;align-items:center;gap:8px}
+  #msg i{width:10px;height:10px;border-radius:50%;background:#777;display:inline-block}
+  #msg.on i{background:#2ecc71} #msg.load i{background:#f5a623}
+  #clips{display:none;padding:16px 16px 110px;max-width:640px;margin:0 auto}
+  body.clipview main{display:none} body.clipview #clips{display:block}
+  #clips header{display:flex;align-items:center;justify-content:space-between;margin:4px 0 14px}
+  #clips h2{font-size:22px} #clips header small{opacity:.6;font-size:13px}
+  .clip{background:#1c1c1c;border:1px solid #2a2a2a;border-radius:14px;padding:12px 12px 10px;margin-bottom:10px}
+  .clip pre{margin:0 0 8px;white-space:pre-wrap;word-break:break-word;font:15px/1.4 system-ui,sans-serif;max-height:7.2em;overflow:hidden}
+  .clip .meta{display:flex;align-items:center;justify-content:space-between;font-size:12px;opacity:.85}
+  .clip .meta span{opacity:.6}
+  .clip button{background:#2a2a2a;color:#fff;border:0;border-radius:10px;padding:8px 14px;font-size:14px}
+  .clip button.done{background:#1f8f4e}
+  .empty{opacity:.6;text-align:center;margin-top:30vh}
+  nav button.active{color:#fff}
   #confirm{position:fixed;inset:0;background:rgba(0,0,0,.7);display:none;align-items:center;justify-content:center;padding:16px}
   #confirm.open{display:flex}
   #confirm .card{background:#1f1f1f;border-radius:20px;padding:24px 20px 18px;width:100%;max-width:340px;text-align:center}
@@ -90,13 +151,16 @@ const page = (msg) => `<!doctype html><meta name="viewport" content="width=devic
 <main>
   <img src="/icon.png" alt="">
   <h2>AKASH TV</h2>
-  <p id="msg">${msg}</p>
-  <button class="big" onclick="act('start')">${svg('play', 22)} Start</button>
+  <p id="msg"><i></i><span>${msg}</span></p>
+  <button class="big" id="bigbtn" onclick="act(running ? 'stop' : 'start')"></button>
 </main>
+<section id="clips">
+  <header><h2>PC Clipboard</h2><small id="clip-upd"></small></header>
+  <div id="clip-list"><p class="empty">Loading...</p></div>
+</section>
 <nav>
-  <button onclick="act('status')">${svg('home')}Home</button>
-  <button onclick="act('start')">${svg('play')}Start</button>
-  <button onclick="act('stop')">${svg('stop')}Stop</button>
+  <button id="nav-home" onclick="act('status')">${svg('home')}Home</button>
+  <button id="nav-clip" onclick="showClips(true)">${svg('clip')}Clipboard</button>
   <button class="power" onclick="sheet(true)">${svg('power')}Power</button>
 </nav>
 <div id="sheet" onclick="if(event.target===this)sheet(false)">
@@ -119,11 +183,106 @@ const page = (msg) => `<!doctype html><meta name="viewport" content="width=devic
 </div>
 <script>
   const KEY = ${JSON.stringify(KEY)}, msg = document.getElementById('msg');
-  async function act(a) {
-    msg.textContent = '...';
-    try { msg.textContent = (await (await fetch('/' + (a === 'status' ? '' : a) + '?json=1&key=' + KEY)).json()).msg; }
-    catch { msg.textContent = 'PC not reachable'; }
+  const LOADING = { start: 'Starting AKASH TV...', stop: 'Stopping AKASH TV...', status: 'Checking...',
+                    sleep: 'Sending sleep...', restart: 'Sending restart...', shutdown: 'Sending power off...' };
+  const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+  const api = async (p) => (await fetch(p + (p.includes('?') ? '&' : '?') + 'json=1&key=' + KEY)).json();
+  const big = document.getElementById('bigbtn');
+  const BIG = { start: ${JSON.stringify(svg('play', 22))} + ' Start', stop: ${JSON.stringify(svg('stop', 22))} + ' Stop' };
+  let running = ${JSON.stringify(msg)}.includes('running');
+
+  // One main button: shows Start when stopped, Stop when running
+  function renderBig() { big.innerHTML = running ? BIG.stop : BIG.start; big.classList.toggle('stop', running); }
+  function setStatus(text, state) {
+    msg.className = state || '';
+    msg.querySelector('span').textContent = text;
+    if (state !== 'load') { running = state === 'on'; renderBig(); }
   }
+  function setBusy(on, a) {
+    document.body.classList.toggle('busy', on);
+    big.innerHTML = on && (a === 'start' || a === 'stop') ? '<div class="spin"></div> ' + (a === 'start' ? 'Starting' : 'Stopping') : big.innerHTML;
+    if (!on) renderBig();
+  }
+
+  async function act(a) {
+    if (document.body.classList.contains('busy')) return;
+    if (document.body.classList.contains('clipview')) showClips(false);
+    setBusy(true, a);
+    setStatus(LOADING[a], 'load');
+    const t0 = Date.now();
+    try {
+      let r = await api('/' + (a === 'status' ? '' : a));
+      // wait until the app really is up / down (max ~6s)
+      if (a === 'start' || a === 'stop') {
+        for (let i = 0; i < 12 && r.running !== (a === 'start'); i++) { await sleepMs(500); r = await api('/'); }
+        r.msg = r.running ? 'AKASH TV is running' : 'AKASH TV is stopped';
+      }
+      await sleepMs(Math.max(0, 1200 - (Date.now() - t0))); // keep loader visible briefly
+      setStatus(r.msg, r.running ? 'on' : '');
+    } catch { setStatus('PC not reachable', ''); }
+    setBusy(false);
+  }
+  setStatus(msg.textContent, ${JSON.stringify(msg)}.includes('running') ? 'on' : '');
+  // ---- Clipboard view (#clips) ----
+  let clipTimer = null, clipData = [];
+  const ago = (t) => { const s = Math.round((Date.now() - t) / 1000);
+    return s < 60 ? 'just now' : s < 3600 ? Math.floor(s / 60) + ' min ago' : Math.floor(s / 3600) + ' h ago'; };
+  function showClips(on) {
+    document.body.classList.toggle('clipview', on);
+    document.getElementById('nav-clip').classList.toggle('active', on);
+    if (on && location.hash !== '#clips') history.replaceState(null, '', '#clips' );
+    if (!on && location.hash) history.replaceState(null, '', location.pathname + location.search);
+    clearInterval(clipTimer);
+    if (on) { loadClips(); clipTimer = setInterval(loadClips, 3000); }
+  }
+  async function loadClips() {
+    try {
+      const r = await api('/clips');
+      if (JSON.stringify(r.clips) === JSON.stringify(clipData)) return updTimes();
+      clipData = r.clips;
+      const list = document.getElementById('clip-list');
+      if (!clipData.length) { list.innerHTML = '<p class="empty">Nothing copied on the PC yet.<br>Copy some text on the PC and it will show up here.</p>'; return; }
+      list.innerHTML = '';
+      clipData.forEach((c) => {
+        const d = document.createElement('div'); d.className = 'clip';
+        d.innerHTML = '<pre></pre><div class="meta"><span></span><button>Copy</button></div>';
+        d.querySelector('pre').textContent = c.text;
+        d.querySelector('span').dataset.t = c.at;
+        d.querySelector('button').onclick = (e) => copyText(c.text, e.target);
+        list.appendChild(d);
+      });
+      updTimes();
+    } catch { document.getElementById('clip-upd').textContent = 'PC not reachable'; }
+  }
+  function updTimes() {
+    document.querySelectorAll('.clip .meta span').forEach((s) => (s.textContent = ago(+s.dataset.t)));
+    document.getElementById('clip-upd').textContent = 'Updated ' + new Date().toLocaleTimeString();
+  }
+  // Works on plain http too (navigator.clipboard needs https)
+  async function copyText(text, btn) {
+    let ok = false;
+    try { await navigator.clipboard.writeText(text); ok = true; } catch {}
+    if (!ok) {
+      const ta = document.createElement('textarea'); ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta); ta.select(); ta.setSelectionRange(0, text.length);
+      try { ok = document.execCommand('copy'); } catch {}
+      ta.remove();
+    }
+    btn.textContent = ok ? 'Copied ✓' : 'Copy failed'; btn.classList.toggle('done', ok);
+    setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('done'); }, 1500);
+  }
+  if (location.hash === '#clips') showClips(true);
+
+  // Heartbeat: PC tracks the clipboard only while this page is open and visible
+  let hb = null;
+  const ping = () => fetch('/ping?key=' + KEY).catch(() => {});
+  function heartbeat() {
+    clearInterval(hb);
+    if (document.visibilityState === 'visible') { ping(); hb = setInterval(ping, 3000); }
+  }
+  document.addEventListener('visibilitychange', heartbeat);
+  heartbeat();
+
   const ASK = {
     sleep:    { t: 'Sleep PC?',     d: 'PC will go to sleep. You will need to wake it manually.', y: 'Sleep' },
     restart:  { t: 'Restart PC?',   d: 'PC will restart now. Unsaved work will be lost.',         y: 'Restart' },
@@ -150,6 +309,13 @@ http.createServer((req, res) => {
     return fs.createReadStream(path.join(ROOT, 'assets', 'icon.png')).pipe(res);
   }
   if (u.searchParams.get('key') !== KEY) { res.writeHead(403); return res.end('Forbidden'); }
+  if (u.pathname === '/ping') { touch(); res.writeHead(204); return res.end(); }
+  if (u.pathname === '/clips') {
+    touch();
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    return res.end(JSON.stringify({ clips }));
+  }
+  if (u.pathname === '/clipboard') u.pathname = '/'; // direct link: /clipboard?key=... opens the page (use #clips)
   if (u.pathname === '/manifest.json') {
     res.writeHead(200, { 'Content-Type': 'application/manifest+json' });
     return res.end(JSON.stringify({
