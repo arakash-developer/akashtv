@@ -107,6 +107,99 @@ function setPCClipboard(text) {
 
 const MAX_SEND = 100000; // chars
 
+// ---- Files: phone <-> PC Downloads folder ----
+const DOWNLOADS = path.join(os.homedir(), 'Downloads');
+
+// Only plain file names inside Downloads (blocks "../" tricks)
+function safeName(name) {
+  const n = path.basename(String(name || '')).replace(/[<>:"/|?*\x00-\x1f]/g, '_').trim();
+  return n && n !== '.' && n !== '..' ? n : null;
+}
+function inDownloads(name) {
+  const n = safeName(name);
+  if (!n) return null;
+  const full = path.resolve(DOWNLOADS, n);
+  return path.dirname(full) === path.resolve(DOWNLOADS) ? full : null;
+}
+// "photo.jpg" -> "photo (1).jpg" if it already exists
+function freeName(name) {
+  const ext = path.extname(name), base = name.slice(0, name.length - ext.length);
+  let n = name, i = 1;
+  while (fs.existsSync(path.join(DOWNLOADS, n))) n = `${base} (${i++})${ext}`;
+  return n;
+}
+
+function listDownloads() {
+  try {
+    return fs.readdirSync(DOWNLOADS, { withFileTypes: true })
+      .filter((d) => d.isFile() && !d.name.startsWith('.') && !/\.(crdownload|part|tmp)$/i.test(d.name) && d.name !== 'desktop.ini')
+      .map((d) => { const st = fs.statSync(path.join(DOWNLOADS, d.name)); return { name: d.name, size: st.size, at: st.mtimeMs }; })
+      .sort((a, b) => b.at - a.at)
+      .slice(0, 200);
+  } catch { return []; }
+}
+
+// Phone -> PC: raw file body streamed straight to disk (no buffering = fast)
+function receiveUpload(req, res, rawName) {
+  const name = safeName(rawName);
+  const json = (code, o) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(o)); };
+  if (!name) return json(400, { ok: false, msg: 'Bad file name' });
+  const finalName = freeName(name);
+  const tmp = path.join(DOWNLOADS, finalName + '.akashtv-part');
+  const out = fs.createWriteStream(tmp);
+  let failed = false;
+  const fail = () => { if (failed) return; failed = true; out.destroy(); fs.rm(tmp, { force: true }, () => {}); };
+  req.on('aborted', fail);
+  out.on('error', () => { fail(); json(500, { ok: false, msg: 'Could not save file' }); });
+  out.on('finish', () => {
+    if (failed) return;
+    fs.rename(tmp, path.join(DOWNLOADS, freeName(finalName)), (e) => {
+      if (e) return json(500, { ok: false, msg: 'Could not save file' });
+      console.log('[FILE] phone -> PC:', finalName);
+      json(200, { ok: true, name: finalName });
+    });
+  });
+  req.pipe(out);
+}
+
+// ---- "Send to AKASH TV" (right-click on any PC file) -> shows up on the phone ----
+const SHARED_FILE = path.join(ROOT, 'pairings', 'shared.json');
+let shared = [];
+try { shared = JSON.parse(fs.readFileSync(SHARED_FILE, 'utf8')); } catch {}
+const saveShared = () => { try { fs.writeFileSync(SHARED_FILE, JSON.stringify(shared, null, 2)); } catch {} };
+const isLocal = (req) => ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(req.socket.remoteAddress);
+
+function addShared(full) {
+  let st;
+  try { st = fs.statSync(full); } catch { return null; }
+  if (!st.isFile()) return null;
+  shared = shared.filter((s) => s.path !== full);
+  const item = { id: crypto.randomBytes(6).toString('hex'), path: full, name: path.basename(full), size: st.size, at: Date.now() };
+  shared.unshift(item);
+  shared.length = Math.min(shared.length, 100);
+  saveShared();
+  console.log('[FILE] shared to phone:', full);
+  return item;
+}
+function sharedList() {
+  return shared.filter((s) => fs.existsSync(s.path)).map(({ id, name, size, at }) => ({ id, name, size, at }));
+}
+
+// PC -> phone: stream the file as a download
+function sendDownload(res, rawName, id) {
+  const sh = id && shared.find((s) => s.id === id);
+  const full = sh ? sh.path : inDownloads(rawName);
+  let st;
+  try { st = full && fs.statSync(full); } catch {}
+  if (!st || !st.isFile()) { res.writeHead(404); return res.end('File not found'); }
+  res.writeHead(200, {
+    'Content-Type': 'application/octet-stream',
+    'Content-Length': st.size,
+    'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(path.basename(full))}`
+  });
+  fs.createReadStream(full, { highWaterMark: 1024 * 1024 }).pipe(res);
+}
+
 // PC power actions (small delay so the phone gets the reply first)
 const POWER = {
   sleep:    { msg: 'PC is going to sleep',  run: () => execFile('rundll32.exe', ['powrprof.dll,SetSuspendState', '0,1,0']) },
@@ -115,6 +208,9 @@ const POWER = {
 };
 
 const ICONS = {
+  file:  '<path d="M6 2h8l6 6v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2zm7 1.5V9h5.5zM8 13v2h8v-2zm0 4v2h5v-2z"/>',
+  up:    '<path d="M12 3l6 6h-4v6h-4V9H6zM4 19h16v2H4z"/>',
+  down:  '<path d="M10 3h4v6h4l-6 6-6-6h4zM4 19h16v2H4z"/>',
   clip:  '<path d="M9 3h6a1 1 0 0 1 1 1v1h2a2 2 0 0 1 2 2v13a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2V4a1 1 0 0 1 1-1zm0 2v2h6V5zm-1 6v2h8v-2zm0 4v2h6v-2z"/>',
   home:  '<path d="M3 11l9-8 9 8v10h-6v-6H9v6H3z"/>',
   play:  '<path d="M7 4l14 8-14 8z"/>',
@@ -154,6 +250,21 @@ const page = (msg) => `<!doctype html><meta name="viewport" content="width=devic
   #msg.on i{background:#2ecc71} #msg.load i{background:#f5a623}
   #clips{display:none;padding:16px 16px 110px;max-width:640px;margin:0 auto}
   body.clipview main{display:none} body.clipview #clips{display:block}
+  #files{display:none;padding:16px 16px 110px;max-width:640px;margin:0 auto}
+  body.fileview main{display:none} body.fileview #files{display:block}
+  #files header{display:flex;align-items:center;justify-content:space-between;margin:4px 0 14px}
+  #files h2{font-size:22px;margin:0} #files header small{opacity:.6;font-size:13px}
+  .upload{display:flex;flex-direction:column;align-items:center;gap:6px;border:2px dashed #e0102e;border-radius:16px;padding:22px;background:#1a1012;color:#fff;cursor:pointer}
+  .upload input{display:none} .upload small{opacity:.6;font-size:12px}
+  .sec{font-size:15px;margin:22px 0 10px;opacity:.9} .sec small{opacity:.55;font-weight:400;font-size:12px}
+  .frow{display:flex;align-items:center;gap:10px;background:#1c1c1c;border:1px solid #2a2a2a;border-radius:12px;padding:10px 12px;margin-bottom:8px}
+  .frow .fi{flex:1;min-width:0} .frow .fn{font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .frow .fs{font-size:12px;opacity:.6;margin-top:2px}
+  .frow a.dl{background:#1d4f8a;color:#fff;border-radius:10px;padding:8px 12px;display:flex;text-decoration:none}
+  .frow button.x{background:none;border:0;color:#888;font-size:20px;padding:4px 6px}
+  .bar{height:6px;background:#333;border-radius:4px;margin-top:6px;overflow:hidden} .bar i{display:block;height:100%;width:0;background:#e0102e;transition:width .2s}
+  .frow.done .bar i{background:#1f8f4e} .frow.err .bar i{background:#888}
+  .empty-s{opacity:.5;font-size:14px;margin:4px 2px}
   #clips header{display:flex;align-items:center;justify-content:space-between;margin:4px 0 14px}
   #clips h2{font-size:22px} #clips header small{opacity:.6;font-size:13px}
   .clip{background:#1c1c1c;border:1px solid #2a2a2a;border-radius:14px;padding:12px 12px 10px;margin-bottom:10px}
@@ -188,6 +299,18 @@ const page = (msg) => `<!doctype html><meta name="viewport" content="width=devic
   <p id="msg"><i></i><span>${msg}</span></p>
   <button class="big" id="bigbtn" onclick="act(running ? 'stop' : 'start')"></button>
 </main>
+<section id="files">
+  <header><h2>Files</h2><small id="files-upd"></small></header>
+  <label class="upload">
+    <input type="file" id="file-input" multiple onchange="uploadFiles(this.files)">
+    ${svg('up', 30)}<b>Send files to PC</b><small>Saved in the PC Downloads folder</small>
+  </label>
+  <div id="up-list"></div>
+  <h3 class="sec">From PC <small>(right-click &rarr; Send to AKASH TV)</small></h3>
+  <div id="shared-list"></div>
+  <h3 class="sec">PC Downloads folder</h3>
+  <div id="dl-list"><p class="empty-s">Loading...</p></div>
+</section>
 <section id="clips">
   <header><h2>Clipboard</h2><small id="clip-upd"></small></header>
   <div class="sendbox">
@@ -199,6 +322,7 @@ const page = (msg) => `<!doctype html><meta name="viewport" content="width=devic
 <nav>
   <button id="nav-home" onclick="act('status')">${svg('home')}Home</button>
   <button id="nav-clip" onclick="showClips(true)">${svg('clip')}Clipboard</button>
+  <button id="nav-files" onclick="showFiles(true)">${svg('file')}Files</button>
   <button class="power" onclick="sheet(true)">${svg('power')}Power</button>
 </nav>
 <div id="sheet" onclick="if(event.target===this)sheet(false)">
@@ -245,6 +369,7 @@ const page = (msg) => `<!doctype html><meta name="viewport" content="width=devic
   async function act(a) {
     if (document.body.classList.contains('busy')) return;
     if (document.body.classList.contains('clipview')) showClips(false);
+    if (document.body.classList.contains('fileview')) showFiles(false);
     setBusy(true, a);
     setStatus(LOADING[a], 'load');
     const t0 = Date.now();
@@ -265,7 +390,84 @@ const page = (msg) => `<!doctype html><meta name="viewport" content="width=devic
   let clipTimer = null, clipData = [];
   const ago = (t) => { const s = Math.round((Date.now() - t) / 1000);
     return s < 60 ? 'just now' : s < 3600 ? Math.floor(s / 60) + ' min ago' : Math.floor(s / 3600) + ' h ago'; };
+  // ---- Files view (#files) ----
+  let filesTimer = null;
+  const fmtSize = (b) => b < 1024 ? b + ' B' : b < 1048576 ? (b / 1024).toFixed(0) + ' KB' : b < 1073741824 ? (b / 1048576).toFixed(1) + ' MB' : (b / 1073741824).toFixed(2) + ' GB';
+  function showFiles(on) {
+    if (on) showClips(false);
+    document.body.classList.toggle('fileview', on);
+    document.getElementById('nav-files').classList.toggle('active', on);
+    if (on && location.hash !== '#files') history.replaceState(null, '', '#files');
+    if (!on && location.hash === '#files') history.replaceState(null, '', location.pathname + location.search);
+    clearInterval(filesTimer);
+    if (on) { loadFiles(); filesTimer = setInterval(loadFiles, 4000); }
+  }
+  function fileRow(name, sub, href, onRemove) {
+    const r = document.createElement('div'); r.className = 'frow';
+    r.innerHTML = '<div class="fi"><div class="fn"></div><div class="fs"></div></div>';
+    r.querySelector('.fn').textContent = name; r.querySelector('.fs').textContent = sub;
+    if (href) {
+      const a = document.createElement('a'); a.className = 'dl'; a.href = href; a.setAttribute('download', name);
+      a.innerHTML = ${JSON.stringify(svg('down', 20))}; r.appendChild(a);
+    }
+    if (onRemove) { const x = document.createElement('button'); x.className = 'x'; x.textContent = '×'; x.onclick = onRemove; r.appendChild(x); }
+    return r;
+  }
+  let filesSig = '';
+  async function loadFiles() {
+    try {
+      const r = await api('/files');
+      document.getElementById('files-upd').textContent = 'Updated ' + new Date().toLocaleTimeString();
+      const sig = JSON.stringify(r);
+      if (sig === filesSig) return;
+      filesSig = sig;
+      const sl = document.getElementById('shared-list'); sl.innerHTML = '';
+      if (!r.shared.length) sl.innerHTML = '<p class="empty-s">Nothing yet. On the PC, right-click a file and choose Send to AKASH TV.</p>';
+      r.shared.forEach((f) => sl.appendChild(fileRow(f.name, fmtSize(f.size) + ' · ' + ago(f.at),
+        '/download?id=' + f.id + '&key=' + KEY,
+        async () => { await api('/unshare?id=' + f.id); filesSig = ''; loadFiles(); })));
+      const dl = document.getElementById('dl-list'); dl.innerHTML = '';
+      if (!r.files.length) dl.innerHTML = '<p class="empty-s">Downloads folder is empty.</p>';
+      r.files.forEach((f) => dl.appendChild(fileRow(f.name, fmtSize(f.size) + ' · ' + ago(f.at),
+        '/download?name=' + encodeURIComponent(f.name) + '&key=' + KEY)));
+    } catch { document.getElementById('files-upd').textContent = 'PC not reachable'; }
+  }
+  // Phone -> PC: each file is streamed as-is (no form encoding), 3 at a time
+  function uploadOne(file) {
+    return new Promise((resolve) => {
+      const row = fileRow(file.name, fmtSize(file.size) + ' · waiting...');
+      row.querySelector('.fi').insertAdjacentHTML('beforeend', '<div class="bar"><i></i></div>');
+      document.getElementById('up-list').prepend(row);
+      const bar = row.querySelector('.bar i'), sub = row.querySelector('.fs');
+      const xhr = new XMLHttpRequest(), t0 = Date.now();
+      xhr.open('PUT', '/upload?name=' + encodeURIComponent(file.name) + '&key=' + KEY);
+      xhr.upload.onprogress = (e) => {
+        if (!e.lengthComputable) return;
+        const sec = Math.max((Date.now() - t0) / 1000, 0.1);
+        bar.style.width = (e.loaded / e.total * 100).toFixed(1) + '%';
+        sub.textContent = fmtSize(e.loaded) + ' / ' + fmtSize(e.total) + ' · ' + fmtSize(e.loaded / sec) + '/s';
+      };
+      xhr.onload = () => {
+        let r = {}; try { r = JSON.parse(xhr.responseText); } catch {}
+        const ok = xhr.status === 200 && r.ok;
+        row.classList.add(ok ? 'done' : 'err'); bar.style.width = '100%';
+        sub.textContent = ok ? 'Saved to PC Downloads as ' + r.name + ' · ' + fmtSize(file.size / Math.max((Date.now() - t0) / 1000, 0.1)) + '/s' : 'Failed: ' + (r.msg || xhr.status);
+        resolve();
+      };
+      xhr.onerror = () => { row.classList.add('err'); sub.textContent = 'Failed: PC not reachable'; resolve(); };
+      xhr.send(file);
+    });
+  }
+  async function uploadFiles(list) {
+    const files = [...list], workers = [];
+    for (let w = 0; w < 3; w++) workers.push((async () => { while (files.length) await uploadOne(files.shift()); })());
+    await Promise.all(workers);
+    document.getElementById('file-input').value = '';
+    filesSig = ''; loadFiles();
+  }
+
   function showClips(on) {
+    if (on && document.body.classList.contains('fileview')) showFiles(false);
     document.body.classList.toggle('clipview', on);
     document.getElementById('nav-clip').classList.toggle('active', on);
     if (on && location.hash !== '#clips') history.replaceState(null, '', '#clips' );
@@ -387,6 +589,7 @@ const page = (msg) => `<!doctype html><meta name="viewport" content="width=devic
   autoSync();
 
   if (location.hash === '#clips') showClips(true);
+  if (location.hash === '#files') showFiles(true);
 
   // Heartbeat: PC tracks the clipboard only while this page is open and visible
   let hb = null;
@@ -425,6 +628,29 @@ http.createServer((req, res) => {
   }
   if (u.searchParams.get('key') !== KEY) { res.writeHead(403); return res.end('Forbidden'); }
   if (u.pathname === '/ping') { touch(); res.writeHead(204); return res.end(); }
+  if (u.pathname === '/files') {
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    return res.end(JSON.stringify({ files: listDownloads(), shared: sharedList() }));
+  }
+  if (u.pathname === '/upload' && req.method === 'PUT') return receiveUpload(req, res, u.searchParams.get('name'));
+  if (u.pathname === '/download') return sendDownload(res, u.searchParams.get('name'), u.searchParams.get('id'));
+  // Right-click "Send to AKASH TV" on the PC (only accepted from this PC itself)
+  if (u.pathname === '/share' && req.method === 'POST') {
+    if (!isLocal(req)) { res.writeHead(403); return res.end('Forbidden'); }
+    let body = '';
+    req.setEncoding('utf8');
+    req.on('data', (c) => (body += c));
+    req.on('end', () => {
+      const items = body.split(String.fromCharCode(10)).map((x) => x.trim()).filter(Boolean).map(addShared).filter(Boolean);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: items.length > 0, count: items.length }));
+    });
+    return;
+  }
+  if (u.pathname === '/unshare') {
+    shared = shared.filter((s) => s.id !== u.searchParams.get('id')); saveShared();
+    res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end('{"ok":true}');
+  }
   if (u.pathname === '/clips') {
     touch();
     res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
