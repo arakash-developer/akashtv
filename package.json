@@ -1,5 +1,6 @@
 {
-  "name": "pc-youtube-tv",
+  "name": "akash-tv",
+  "productName": "AKASH TV",
   "version": "1.0.0",
   "description": "Turn a PC into a YouTube TV screen you control from your phone",
   "main": "main.js",
@@ -12,8 +13,8 @@
     "electron-builder": "^25.0.0"
   },
   "build": {
-    "appId": "com.akash.pcyoutubetv",
-    "productName": "PC YouTube TV",
+    "appId": "com.akash.akashtv",
+    "productName": "AKASH TV",
     "win": { "target": "nsis" },
     "linux": { "target": "AppImage" },
     "mac": { "target": "dmg" }

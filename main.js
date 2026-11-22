@@ -173,9 +173,10 @@ async function start() {
 
 function createWindow() {
   win = new BrowserWindow({
-    width: 1280, height: 720, fullscreen: true, autoHideMenuBar: true, backgroundColor: '#000000',
+    title: 'AKASH TV', width: 1280, height: 720, fullscreen: true, autoHideMenuBar: true, backgroundColor: '#000000',
     webPreferences: { nodeIntegration: false, contextIsolation: true, sandbox: true, backgroundThrottling: false }
   });
+  win.on('page-title-updated', (e) => e.preventDefault()); // keep "AKASH TV" as window title
   win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
 
   win.webContents.on('did-navigate', (_e, url) => {

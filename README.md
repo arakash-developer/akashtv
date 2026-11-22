@@ -1,4 +1,4 @@
-# PC YouTube TV
+# AKASH TV
 
 Turns any PC into a YouTube TV screen. Your phone's YouTube app becomes the remote.
 
